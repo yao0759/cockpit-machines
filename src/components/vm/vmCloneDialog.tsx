@@ -18,7 +18,7 @@
  */
 
 import cockpit from 'cockpit';
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 import type { ConnectionName } from '../../types';
 
@@ -28,6 +28,9 @@ import {
     Modal, ModalBody, ModalFooter, ModalHeader
 } from '@patternfly/react-core/dist/esm/components/Modal';
 import { TextInput } from "@patternfly/react-core/dist/esm/components/TextInput";
+import { Checkbox } from "@patternfly/react-core/dist/esm/components/Checkbox";
+import { Tooltip } from "@patternfly/react-core/dist/esm/components/Tooltip";
+import { HelperText, HelperTextItem } from "@patternfly/react-core/dist/esm/components/HelperText";
 
 import { FormHelper } from 'cockpit-components-form-helper.jsx';
 import { isEmpty, isObjectEmpty } from '../../helpers.js';
@@ -45,6 +48,11 @@ interface DialogError {
     dialogError?: string;
 }
 
+interface FileSystemInfo {
+    hasReflink: boolean;
+    fsType: string;
+}
+
 export const CloneDialog = ({
     name,
     connectionName
@@ -57,6 +65,70 @@ export const CloneDialog = ({
     const [inProgress, setInProgress] = useState(false);
     const [virtCloneOutput, setVirtCloneOutput] = useState('');
     const [error, dialogErrorSet] = useState<DialogError>({});
+    const [fsInfo, setFsInfo] = useState<FileSystemInfo>({ hasReflink: false, fsType: '' });
+    const [useReflink, setUseReflink] = useState(false);
+    const [isCheckingFs, setIsCheckingFs] = useState(true);
+
+    // 检测文件系统类型和reflink功能
+    useEffect(() => {
+        setIsCheckingFs(true);
+        // 获取VM存储路径
+        cockpit.spawn(
+            ["virsh", "--connect", "qemu:///" + connectionName, "domblklist", name],
+            { superuser: connectionName === "system" ? "try" : false }
+        ).then(output => {
+            const lines = output.split('\n');
+            // 跳过标题行，查找第一个磁盘路径
+            let diskPath = '';
+            for (let i = 1; i < lines.length; i++) {
+                const parts = lines[i].trim().split(/\s+/);
+                if (parts.length >= 2 && parts[1] && parts[1] !== '-') {
+                    diskPath = parts[1];
+                    break;
+                }
+            }
+
+            if (diskPath) {
+                // 获取磁盘所在的文件系统类型
+                return cockpit.spawn(
+                    ["df", "--output=fstype", diskPath],
+                    { superuser: connectionName === "system" ? "try" : false }
+                ).then(fsOutput => {
+                    const fsLines = fsOutput.split('\n');
+                    // 第一行是标题，第二行是文件系统类型
+                    if (fsLines.length >= 2) {
+                        const fsType = fsLines[1].trim();
+                        
+                        // 检查是否支持reflink
+                        if (fsType === 'xfs' || fsType === 'btrfs') {
+                            return cockpit.spawn(
+                                ["cp", "--reflink=always", diskPath, diskPath + ".test"],
+                                { superuser: connectionName === "system" ? "try" : false, err: "message" }
+                            ).then(() => {
+                                // 清理测试文件
+                                cockpit.spawn(
+                                    ["rm", "-f", diskPath + ".test"],
+                                    { superuser: connectionName === "system" ? "try" : false }
+                                );
+                                setFsInfo({ hasReflink: true, fsType });
+                                setUseReflink(true);
+                            }).catch(() => {
+                                setFsInfo({ hasReflink: false, fsType });
+                            });
+                        } else {
+                            setFsInfo({ hasReflink: false, fsType });
+                        }
+                    }
+                }).catch(() => {
+                    console.log("Failed to get filesystem type");
+                });
+            }
+        }).catch(err => {
+            console.log("Failed to get VM disk path:", err);
+        }).finally(() => {
+            setIsCheckingFs(false);
+        });
+    }, [name, connectionName]);
 
     function validateParams() {
         const validation: Validation = {};
@@ -74,12 +146,22 @@ export const CloneDialog = ({
         }
 
         setInProgress(true);
+        
+        // 构建命令参数
+        const cloneArgs = [
+            "virt-clone", "--connect", "qemu:///" + connectionName,
+            "--original", name, "--name", newVmName,
+        ];
+        
+        // 如果支持并选择了reflink，添加reflink选项
+        if (useReflink && fsInfo.hasReflink) {
+            cloneArgs.push("--reflink");
+        } else {
+            cloneArgs.push("--auto-clone");
+        }
+        
         return cockpit.spawn(
-            [
-                "virt-clone", "--connect", "qemu:///" + connectionName,
-                "--original", name, "--name", newVmName,
-                "--auto-clone"
-            ],
+            cloneArgs,
             {
                 pty: true,
                 ...(connectionName === "system" ? { superuser: "try" } : { })
@@ -110,6 +192,38 @@ export const CloneDialog = ({
                                    onChange={(_, value) => setNewVmName(value)} />
                         <FormHelper helperTextInvalid={validationFailed.name} />
                     </FormGroup>
+                    
+                    {isCheckingFs ? (
+                        <FormGroup label={_("Reflink copy")} fieldId="vm-reflink">
+                            <div>{_("Checking filesystem support...")}</div>
+                        </FormGroup>
+                    ) : fsInfo.hasReflink ? (
+                        <FormGroup label={_("Reflink copy")} fieldId="vm-reflink">
+                            <Checkbox
+                                id='vm-reflink-checkbox'
+                                isChecked={useReflink}
+                                onChange={checked => setUseReflink(checked)}
+                                label={_("Use reflink for faster, space-efficient cloning")}
+                            />
+                            <HelperText>
+                                <HelperTextItem>
+                                    {cockpit.format(_("Detected $0 filesystem with reflink support"), fsInfo.fsType)}
+                                </HelperTextItem>
+                            </HelperText>
+                        </FormGroup>
+                    ) : fsInfo.fsType === 'xfs' || fsInfo.fsType === 'btrfs' ? (
+                        <FormGroup label={_("Reflink copy")} fieldId="vm-reflink">
+                            <div>
+                                {cockpit.format(_("$0 filesystem detected but reflink is not enabled"), fsInfo.fsType)}
+                            </div>
+                        </FormGroup>
+                    ) : fsInfo.fsType ? (
+                        <FormGroup label={_("Reflink copy")} fieldId="vm-reflink">
+                            <div>
+                                {cockpit.format(_("$0 filesystem does not support reflink"), fsInfo.fsType)}
+                            </div>
+                        </FormGroup>
+                    ) : null}
                 </Form>
             </ModalBody>
             <ModalFooter>
